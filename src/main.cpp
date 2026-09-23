@@ -23,13 +23,14 @@ namespace {
 using boost::asio::ip::tcp;
 
 constexpr unsigned short kPort = 8080;
+constexpr char kDelimiter = ';';
 
 std::mutex output_mutex;
 std::mutex error_mutex;
 
-void print_line(const std::string& line) {
+void print_item(const std::string& item) {
     const std::lock_guard<std::mutex> lock(output_mutex);
-    std::cout.write(line.data(), static_cast<std::streamsize>(line.size()));
+    std::cout.write(item.data(), static_cast<std::streamsize>(item.size()));
     std::cout.put('\n');
     std::cout.flush();
 }
@@ -93,9 +94,9 @@ void process_client(tcp::socket socket) {
         decompressed.push(socket_source(std::move(shared_socket)));
         decompressed.exceptions(std::ios::badbit);
 
-        std::string line;
-        while (std::getline(decompressed, line)) {
-            print_line(line);
+        std::string item;
+        while (std::getline(decompressed, item, kDelimiter)) {
+            print_item(item);
         }
     } catch (const boost::iostreams::gzip_error& error) {
         report_error(peer, std::string("invalid gzip stream: ") + error.what());

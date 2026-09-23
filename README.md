@@ -1,12 +1,17 @@
 # stream_gzip
 
 A C++17 TCP server that listens on `0.0.0.0:8080`, decompresses gzip data from
-each client, and writes each newline-delimited item to standard output.
+each client, and writes each semicolon-delimited item to standard output. The
+semicolon is consumed, and each extracted item is followed by a newline on
+standard output.
 
 Connections may contain concatenated gzip members. Member boundaries do not
-act as line boundaries, so a line may start in one member and finish in the
-next. A client finishes its stream by closing the connection or shutting down
-its sending side. The server does not send a response.
+act as item boundaries, so an item may start in one member and finish in the
+next. Newlines, carriage returns, and all other non-semicolon bytes are item
+content. Repeated semicolons produce empty items, while a trailing semicolon
+does not produce an additional item. There is no escaping mechanism. A client
+finishes its stream by closing the connection or shutting down its sending
+side. The server does not send a response.
 
 ## Build
 
@@ -24,10 +29,10 @@ at least one thread).
 
 ## Run and test
 
-Run `stream_gzip` (or `stream_gzip.exe` on Windows). Output lines from a single
+Run `stream_gzip` (or `stream_gzip.exe` on Windows). Output items from a single
 client retain their order; ordering between clients is intentionally
-nondeterministic. Complete lines are written under a mutex so their bytes do
-not interleave.
+nondeterministic. Complete items, including their appended newlines, are
+written under a mutex so their bytes do not interleave.
 
 If Python 3 is available when configuring, the integration test is registered
 with CTest:
@@ -36,6 +41,7 @@ with CTest:
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-The test exercises empty and unterminated lines, CRLF input, concatenated
-members, a line split across members, concurrent clients, malformed and
-truncated gzip input, and continued service after errors.
+The test exercises empty and unterminated items, embedded newlines and carriage
+returns, concatenated members, an item split across members, concurrent
+clients, malformed and truncated gzip input, and continued service after
+errors.

@@ -49,12 +49,12 @@ def main():
     try:
         wait_until_listening(process)
 
-        send(gzip.compress(b"one\n\ncrlf\r\nlast"))
-        send(gzip.compress(b"joined ") + gzip.compress(b"line\n"))
+        send(gzip.compress(b"one;;embedded\nnewline;crlf\r\ninside;last"))
+        send(gzip.compress(b"joined ") + gzip.compress(b"item;"))
 
         concurrent_payloads = [
-            b"client-a-1\nclient-a-2\n",
-            b"client-b-1\nclient-b-2\n",
+            b"client-a-1;client-a-2;",
+            b"client-b-1;client-b-2;",
         ]
         threads = [
             threading.Thread(target=send, args=(gzip.compress(payload),))
@@ -67,9 +67,9 @@ def main():
 
         send(b"not a gzip stream")
         send(gzip.compress(b"truncated")[:-4])
-        send(gzip.compress(b"after-error\n"))
+        send(gzip.compress(b"after-error;"))
 
-        # Every complete line is flushed by the server. Allow the worker pool
+        # Every complete item is flushed by the server. Allow the worker pool
         # to finish the final sessions before stopping this intentionally
         # non-terminating service.
         time.sleep(1)
@@ -81,9 +81,12 @@ def main():
     expected = [
         b"one\n",
         b"\n",
+        b"embedded\n",
+        b"newline\n",
         b"crlf\r\n",
+        b"inside\n",
         b"last\n",
-        b"joined line\n",
+        b"joined item\n",
         b"client-a-1\n",
         b"client-a-2\n",
         b"client-b-1\n",
@@ -95,14 +98,22 @@ def main():
         raise AssertionError(f"unexpected output\nactual: {actual!r}\nexpected: {expected!r}")
 
     ordered_groups = [
-        [b"one\n", b"\n", b"crlf\r\n", b"last\n"],
+        [
+            b"one\n",
+            b"\n",
+            b"embedded\n",
+            b"newline\n",
+            b"crlf\r\n",
+            b"inside\n",
+            b"last\n",
+        ],
         [b"client-a-1\n", b"client-a-2\n"],
         [b"client-b-1\n", b"client-b-2\n"],
     ]
     for group in ordered_groups:
         positions = [actual.index(line) for line in group]
         if positions != sorted(positions):
-            raise AssertionError(f"per-client line order changed: {group!r} in {actual!r}")
+            raise AssertionError(f"per-client item order changed: {group!r} in {actual!r}")
 
     invalid_gzip_reports = sum(
         b"invalid gzip stream" in line.lower() for line in stderr.splitlines()
