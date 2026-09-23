@@ -1,17 +1,19 @@
 # stream_gzip
 
-A C++17 TCP server that listens on `0.0.0.0:8080`, decompresses gzip data from
-each client, and writes each semicolon-delimited item to standard output. The
-semicolon is consumed, and each extracted item is followed by a newline on
-standard output.
+A C++17 TCP server that listens on `0.0.0.0:8080`, decompresses a Snappy
+framed stream from each client, and writes each semicolon-delimited item to
+standard output. The semicolon is consumed, and each extracted item is
+followed by a newline on standard output.
 
-Connections may contain concatenated gzip members. Member boundaries do not
-act as item boundaries, so an item may start in one member and finish in the
-next. Newlines, carriage returns, and all other non-semicolon bytes are item
-content. Repeated semicolons produce empty items, while a trailing semicolon
-does not produce an additional item. There is no escaping mechanism. A client
-finishes its stream by closing the connection or shutting down its sending
-side. The server does not send a response.
+Connections must contain the Snappy stream identifier followed by standard
+compressed or uncompressed data chunks. Chunk boundaries and repeated stream
+identifiers do not act as item boundaries, so an item may start in one chunk
+and finish in the next. Checksums are validated, and standard skippable chunks
+are ignored. Newlines, carriage returns, and all other non-semicolon bytes are
+item content. Repeated semicolons produce empty items, while a trailing
+semicolon does not produce an additional item. There is no escaping mechanism.
+A client finishes its stream by closing the connection or shutting down its
+sending side. The server does not send a response.
 
 ## Build
 
@@ -23,9 +25,9 @@ cmake -S . -B build \
 cmake --build build --config Release
 ```
 
-The vcpkg manifest installs Boost.Asio, Boost.Iostreams, and zlib. The server
-uses a bounded worker pool sized to `std::thread::hardware_concurrency()` (and
-at least one thread).
+The vcpkg manifest installs Boost.Asio, Boost.Iostreams, Google Snappy, and
+CRC32C. The server uses a bounded worker pool sized to
+`std::thread::hardware_concurrency()` (and at least one thread).
 
 ## Run and test
 
@@ -42,6 +44,7 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 The test exercises empty and unterminated items, embedded newlines and carriage
-returns, concatenated members, an item split across members, concurrent
-clients, malformed and truncated gzip input, and continued service after
+returns, compressed and uncompressed chunks, repeated stream identifiers,
+skippable chunks, fragmented writes, an item split across chunks, concurrent
+clients, malformed and truncated Snappy input, and continued service after
 errors.

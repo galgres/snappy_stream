@@ -3,7 +3,8 @@ cmake_minimum_required(VERSION 3.20)
 project(stream_gzip VERSION 1.0.0 LANGUAGES CXX)
 
 find_package(Boost CONFIG REQUIRED COMPONENTS asio iostreams)
-find_package(ZLIB REQUIRED)
+find_package(Snappy CONFIG REQUIRED)
+find_package(Crc32c CONFIG REQUIRED)
 
 add_executable(stream_gzip
     src/main.cpp
@@ -13,7 +14,8 @@ target_compile_features(stream_gzip PRIVATE cxx_std_17)
 target_link_libraries(stream_gzip PRIVATE
     Boost::asio
     Boost::iostreams
-    ZLIB::ZLIB
+    Snappy::snappy
+    Crc32c::crc32c
 )
 
 if(WIN32)
