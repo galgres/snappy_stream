@@ -1,0 +1,19 @@
+{
+  "name": "stream-gzip",
+  "version-string": "1.0.0",
+  "builtin-baseline": "3af1d1e60af2b2abf55760538cd607829029b07a",
+  "dependencies": [
+    {
+      "name": "boost-asio",
+      "default-features": false
+    },
+    {
+      "name": "boost-iostreams",
+      "default-features": false,
+      "features": [
+        "zlib"
+      ]
+    },
+    "zlib"
+  ]
+}
