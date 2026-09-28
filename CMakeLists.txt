@@ -32,12 +32,18 @@ include(CTest)
 if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
-        add_test(
-            NAME stream_gzip_integration
-            COMMAND "${Python3_EXECUTABLE}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration_test.py"
-                    "$<TARGET_FILE:stream_gzip>"
-        )
-        set_tests_properties(stream_gzip_integration PROPERTIES TIMEOUT 20)
+        foreach(compression IN ITEMS gzip snappy)
+            add_test(
+                NAME stream_gzip_${compression}_integration
+                COMMAND "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration_test.py"
+                        "$<TARGET_FILE:stream_gzip>"
+                        "${compression}"
+            )
+            set_tests_properties(
+                stream_gzip_${compression}_integration
+                PROPERTIES TIMEOUT 20 RESOURCE_LOCK stream_gzip_port
+            )
+        endforeach()
     endif()
 endif()

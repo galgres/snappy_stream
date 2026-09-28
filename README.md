@@ -1,19 +1,21 @@
 # stream_gzip
 
-A C++17 TCP server that listens on `0.0.0.0:8080`, decompresses a Snappy
-framed stream from each client, and writes each semicolon-delimited item to
-standard output. The semicolon is consumed, and each extracted item is
-followed by a newline on standard output.
+A C++17 TCP server that listens on `0.0.0.0:8080`, decompresses either a gzip
+stream or a Snappy framed stream from each client, and writes each
+semicolon-delimited item to standard output. The semicolon is consumed, and
+each extracted item is followed by a newline on standard output.
 
-Connections must contain the Snappy stream identifier followed by standard
-compressed or uncompressed data chunks. Chunk boundaries and repeated stream
-identifiers do not act as item boundaries, so an item may start in one chunk
-and finish in the next. Checksums are validated, and standard skippable chunks
-are ignored. Newlines, carriage returns, and all other non-semicolon bytes are
-item content. Repeated semicolons produce empty items, while a trailing
-semicolon does not produce an additional item. There is no escaping mechanism.
-A client finishes its stream by closing the connection or shutting down its
-sending side. The server does not send a response.
+In Snappy mode, connections must contain the Snappy stream identifier followed
+by standard compressed or uncompressed data chunks. Chunk boundaries and
+repeated stream identifiers do not act as item boundaries, checksums are
+validated, and standard skippable chunks are ignored. In gzip mode, each
+connection carries a gzip stream.
+
+Newlines, carriage returns, and all other non-semicolon bytes are item content.
+Repeated semicolons produce empty items, while a trailing semicolon does not
+produce an additional item. There is no escaping mechanism. A client finishes
+its stream by closing the connection or shutting down its sending side. The
+server does not send a response.
 
 ## Build
 
@@ -31,8 +33,16 @@ CRC32C. The server uses a bounded worker pool sized to
 
 ## Run and test
 
-Run `stream_gzip` (or `stream_gzip.exe` on Windows). Output items from a single
-client retain their order; ordering between clients is intentionally
+Run `stream_gzip` (or `stream_gzip.exe` on Windows) with the desired compression
+format:
+
+```sh
+stream_gzip --compression gzip
+stream_gzip --compression snappy
+```
+
+The `--compression` option defaults to `gzip` when omitted. Output items from a
+single client retain their order; ordering between clients is intentionally
 nondeterministic. Complete items, including their appended newlines, are
 written under a mutex so their bytes do not interleave.
 
@@ -43,8 +53,8 @@ with CTest:
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-The test exercises empty and unterminated items, embedded newlines and carriage
-returns, compressed and uncompressed chunks, repeated stream identifiers,
-skippable chunks, fragmented writes, an item split across chunks, concurrent
-clients, malformed and truncated Snappy input, and continued service after
-errors.
+The tests exercise both command-line modes, empty and unterminated items,
+embedded newlines and carriage returns, fragmented writes, concurrent clients,
+malformed and truncated input, and continued service after errors. Snappy tests
+also cover compressed and uncompressed chunks, repeated stream identifiers,
+skippable chunks, checksum validation, and items split across chunks.

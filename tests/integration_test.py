@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import collections
+import gzip
 import socket
 import struct
 import subprocess
@@ -89,7 +90,7 @@ def send_fragmented(payload, fragment_size=1):
         connection.shutdown(socket.SHUT_WR)
 
 
-def wait_until_listening(process):
+def wait_until_listening(process, probe):
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -100,7 +101,7 @@ def wait_until_listening(process):
             )
         try:
             with socket.create_connection((HOST, PORT), timeout=0.1) as connection:
-                connection.sendall(STREAM_IDENTIFIER)
+                connection.sendall(probe)
                 connection.shutdown(socket.SHUT_WR)
                 return
         except OSError:
@@ -109,58 +110,28 @@ def wait_until_listening(process):
 
 
 def main():
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: integration_test.py SERVER_EXECUTABLE")
+    if len(sys.argv) != 3 or sys.argv[2] not in ("gzip", "snappy"):
+        raise SystemExit(
+            "usage: integration_test.py SERVER_EXECUTABLE {gzip|snappy}"
+        )
+    compression = sys.argv[2]
     if crc32c(b"123456789") != 0xE3069283:
         raise AssertionError("CRC32C fixture implementation is invalid")
 
     process = subprocess.Popen(
-        [sys.argv[1]], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        [sys.argv[1], "--compression", compression],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
 
     try:
-        wait_until_listening(process)
+        probe = gzip.compress(b"") if compression == "gzip" else STREAM_IDENTIFIER
+        wait_until_listening(process, probe)
 
-        first_stream = (
-            STREAM_IDENTIFIER
-            + chunk(0x80, b"ignored extension")
-            + chunk(0xFE, b"padding")
-            + compressed_chunk(b"one;;embedded\nnewline;crlf\r\ninside;last")
-        )
-        send_fragmented(first_stream)
-        send(
-            STREAM_IDENTIFIER
-            + compressed_chunk(b"joined ")
-            + STREAM_IDENTIFIER
-            + uncompressed_chunk(b"item;")
-        )
-
-        concurrent_payloads = [
-            b"client-a-1;client-a-2;",
-            b"client-b-1;client-b-2;",
-        ]
-        threads = [
-            threading.Thread(target=send, args=(snappy_stream(payload),))
-            for payload in concurrent_payloads
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-
-        send(b"not a snappy stream")
-        send(snappy_stream(b"truncated")[:-4])
-
-        bad_checksum = bytearray(compressed_chunk(b"bad-checksum;"))
-        bad_checksum[4] ^= 0xFF
-        send(
-            STREAM_IDENTIFIER
-            + compressed_chunk(b"before-corruption;")
-            + bytes(bad_checksum)
-        )
-        send(STREAM_IDENTIFIER + chunk(0x02, b""))
-
-        send(snappy_stream(b"after-error;"))
+        if compression == "gzip":
+            run_gzip_tests()
+        else:
+            run_snappy_tests()
 
         # Every complete item is flushed by the server. Allow the worker pool
         # to finish the final sessions before stopping this intentionally
@@ -170,6 +141,75 @@ def main():
         process.terminate()
         stdout, stderr = process.communicate(timeout=5)
 
+    check_results(compression, stdout, stderr)
+
+
+def run_gzip_tests():
+    first_payload = b"one;;embedded\nnewline;crlf\r\ninside;last"
+    send_fragmented(gzip.compress(first_payload))
+    send(gzip.compress(b"joined item;"))
+
+    concurrent_payloads = [
+        b"client-a-1;client-a-2;",
+        b"client-b-1;client-b-2;",
+    ]
+    threads = [
+        threading.Thread(target=send, args=(gzip.compress(payload),))
+        for payload in concurrent_payloads
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    send(b"not a gzip stream")
+    send(gzip.compress(b"truncated")[:-4])
+    send(gzip.compress(b"after-error;"))
+
+
+def run_snappy_tests():
+    first_stream = (
+        STREAM_IDENTIFIER
+        + chunk(0x80, b"ignored extension")
+        + chunk(0xFE, b"padding")
+        + compressed_chunk(b"one;;embedded\nnewline;crlf\r\ninside;last")
+    )
+    send_fragmented(first_stream)
+    send(
+        STREAM_IDENTIFIER
+        + compressed_chunk(b"joined ")
+        + STREAM_IDENTIFIER
+        + uncompressed_chunk(b"item;")
+    )
+
+    concurrent_payloads = [
+        b"client-a-1;client-a-2;",
+        b"client-b-1;client-b-2;",
+    ]
+    threads = [
+        threading.Thread(target=send, args=(snappy_stream(payload),))
+        for payload in concurrent_payloads
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    send(b"not a snappy stream")
+    send(snappy_stream(b"truncated")[:-4])
+
+    bad_checksum = bytearray(compressed_chunk(b"bad-checksum;"))
+    bad_checksum[4] ^= 0xFF
+    send(
+        STREAM_IDENTIFIER
+        + compressed_chunk(b"before-corruption;")
+        + bytes(bad_checksum)
+    )
+    send(STREAM_IDENTIFIER + chunk(0x02, b""))
+    send(snappy_stream(b"after-error;"))
+
+
+def check_results(compression, stdout, stderr):
     actual = stdout.splitlines(keepends=True)
     expected = [
         b"one\n",
@@ -184,9 +224,10 @@ def main():
         b"client-a-2\n",
         b"client-b-1\n",
         b"client-b-2\n",
-        b"before-corruption\n",
         b"after-error\n",
     ]
+    if compression == "snappy":
+        expected.append(b"before-corruption\n")
 
     if collections.Counter(actual) != collections.Counter(expected):
         raise AssertionError(f"unexpected output\nactual: {actual!r}\nexpected: {expected!r}")
@@ -209,10 +250,12 @@ def main():
         if positions != sorted(positions):
             raise AssertionError(f"per-client item order changed: {group!r} in {actual!r}")
 
-    invalid_snappy_reports = sum(
-        b"invalid snappy stream" in line.lower() for line in stderr.splitlines()
+    invalid_reports = sum(
+        f"invalid {compression} stream".encode() in line.lower()
+        for line in stderr.splitlines()
     )
-    if invalid_snappy_reports < 4:
+    minimum_reports = 4 if compression == "snappy" else 2
+    if invalid_reports < minimum_reports:
         raise AssertionError(f"invalid streams were not reported: {stderr!r}")
 
 
