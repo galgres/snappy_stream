@@ -9,7 +9,10 @@
     },
     {
       "name": "boost-iostreams",
-      "default-features": false
+      "default-features": false,
+      "features": [
+        "zlib"
+      ]
     },
     "crc32c",
     "snappy"
