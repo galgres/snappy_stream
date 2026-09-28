@@ -32,7 +32,7 @@ include(CTest)
 if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
-        foreach(compression IN ITEMS gzip snappy)
+        foreach(compression IN ITEMS gzip snappy none)
             add_test(
                 NAME stream_gzip_${compression}_integration
                 COMMAND "${Python3_EXECUTABLE}"

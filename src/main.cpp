@@ -42,6 +42,7 @@ constexpr std::array<char, 6> kStreamIdentifier = {'s', 'N', 'a', 'P', 'p', 'Y'}
 enum class compression {
     gzip,
     snappy,
+    none,
 };
 
 std::mutex output_mutex;
@@ -130,6 +131,20 @@ private:
 class snappy_stream_error : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
+};
+
+class passthrough_filter {
+public:
+    using char_type = char;
+    using category = boost::iostreams::multichar_input_filter_tag;
+
+    template <typename Source>
+    std::streamsize read(Source& source, char* destination, std::streamsize size) {
+        if (size <= 0) {
+            return 0;
+        }
+        return boost::iostreams::read(source, destination, size);
+    }
 };
 
 std::uint32_t load_little_endian_32(const char* bytes) {
@@ -493,7 +508,8 @@ compression parse_arguments(int argc, char* argv[]) {
         std::string value;
         if (argument == "--compression") {
             if (++index == argc) {
-                throw std::invalid_argument("--compression requires gzip or snappy");
+                throw std::invalid_argument(
+                    "--compression requires gzip, snappy, or none");
             }
             value = argv[index];
         } else if (argument.rfind("--compression=", 0) == 0) {
@@ -511,6 +527,8 @@ compression parse_arguments(int argc, char* argv[]) {
             selected = compression::gzip;
         } else if (value == "snappy") {
             selected = compression::snappy;
+        } else if (value == "none") {
+            selected = compression::none;
         } else {
             throw std::invalid_argument("unsupported compression: " + value);
         }
@@ -559,10 +577,14 @@ int main(int argc, char* argv[]) {
         case compression::snappy:
             run_server<snappy_framed_decompressor>();
             break;
+        case compression::none:
+            run_server<passthrough_filter>();
+            break;
         }
     } catch (const std::invalid_argument& error) {
         std::cerr << "argument error: " << error.what() << '\n'
-                  << "usage: " << argv[0] << " [--compression gzip|snappy]\n";
+                  << "usage: " << argv[0]
+                  << " [--compression gzip|snappy|none]\n";
         return 2;
     } catch (const std::exception& error) {
         std::cerr << "server startup error: " << error.what() << '\n';

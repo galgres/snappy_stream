@@ -110,9 +110,9 @@ def wait_until_listening(process, probe):
 
 
 def main():
-    if len(sys.argv) != 3 or sys.argv[2] not in ("gzip", "snappy"):
+    if len(sys.argv) != 3 or sys.argv[2] not in ("gzip", "snappy", "none"):
         raise SystemExit(
-            "usage: integration_test.py SERVER_EXECUTABLE {gzip|snappy}"
+            "usage: integration_test.py SERVER_EXECUTABLE {gzip|snappy|none}"
         )
     compression = sys.argv[2]
     if crc32c(b"123456789") != 0xE3069283:
@@ -125,13 +125,20 @@ def main():
     )
 
     try:
-        probe = gzip.compress(b"") if compression == "gzip" else STREAM_IDENTIFIER
+        if compression == "gzip":
+            probe = gzip.compress(b"")
+        elif compression == "snappy":
+            probe = STREAM_IDENTIFIER
+        else:
+            probe = b""
         wait_until_listening(process, probe)
 
         if compression == "gzip":
             run_gzip_tests()
-        else:
+        elif compression == "snappy":
             run_snappy_tests()
+        else:
+            run_none_tests()
 
         # Every complete item is flushed by the server. Allow the worker pool
         # to finish the final sessions before stopping this intentionally
@@ -209,6 +216,26 @@ def run_snappy_tests():
     send(snappy_stream(b"after-error;"))
 
 
+def run_none_tests():
+    send_fragmented(b"one;;embedded\nnewline;crlf\r\ninside;last")
+    send(b"joined item;")
+
+    concurrent_payloads = [
+        b"client-a-1;client-a-2;",
+        b"client-b-1;client-b-2;",
+    ]
+    threads = [
+        threading.Thread(target=send, args=(payload,))
+        for payload in concurrent_payloads
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    send(b"after-error;")
+
+
 def check_results(compression, stdout, stderr):
     actual = stdout.splitlines(keepends=True)
     expected = [
@@ -250,13 +277,14 @@ def check_results(compression, stdout, stderr):
         if positions != sorted(positions):
             raise AssertionError(f"per-client item order changed: {group!r} in {actual!r}")
 
-    invalid_reports = sum(
-        f"invalid {compression} stream".encode() in line.lower()
-        for line in stderr.splitlines()
-    )
-    minimum_reports = 4 if compression == "snappy" else 2
-    if invalid_reports < minimum_reports:
-        raise AssertionError(f"invalid streams were not reported: {stderr!r}")
+    if compression != "none":
+        invalid_reports = sum(
+            f"invalid {compression} stream".encode() in line.lower()
+            for line in stderr.splitlines()
+        )
+        minimum_reports = 4 if compression == "snappy" else 2
+        if invalid_reports < minimum_reports:
+            raise AssertionError(f"invalid streams were not reported: {stderr!r}")
 
 
 if __name__ == "__main__":
