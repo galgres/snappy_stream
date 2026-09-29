@@ -9,9 +9,12 @@ In Snappy mode, connections must contain the Snappy stream identifier followed
 by standard compressed or uncompressed data chunks. Chunk boundaries and
 repeated stream identifiers do not act as item boundaries, checksums are
 validated, and standard skippable chunks are ignored. In gzip mode, each
-connection carries a gzip stream. In `none` mode there are no headers, framing,
-checksums, or decoding: every incoming byte except the semicolon delimiter is
-treated as uncompressed item content.
+connection carries one or more gzip members. Members form one continuous
+decompressed payload: a member boundary does not end an application item, and
+the connection may remain open for an arbitrary time before the next member
+arrives. In `none` mode there are no headers, framing, checksums, or decoding:
+every incoming byte except the semicolon delimiter is treated as uncompressed
+item content.
 
 Newlines, carriage returns, and all other non-semicolon bytes are item content.
 Repeated semicolons produce empty items, while a trailing semicolon does not
@@ -29,8 +32,8 @@ cmake -S . -B build \
 cmake --build build --config Release
 ```
 
-The vcpkg manifest installs Boost.Asio, Boost.Iostreams, Google Snappy, and
-CRC32C. The server uses a bounded worker pool sized to
+The vcpkg manifest installs Boost.Asio, Boost.Iostreams, zlib, Google Snappy,
+and CRC32C. The server uses a bounded worker pool sized to
 `std::thread::hardware_concurrency()` (and at least one thread).
 
 ## Run and test
@@ -61,4 +64,8 @@ embedded newlines and carriage returns, fragmented writes, concurrent clients,
 and per-client ordering. Gzip and Snappy tests also cover malformed and
 truncated input and continued service after errors. Snappy tests additionally
 cover compressed and uncompressed chunks, repeated stream identifiers,
-skippable chunks, checksum validation, and items split across chunks.
+skippable chunks, checksum validation, and items split across chunks. Gzip
+tests additionally cover concatenated and empty members, pauses between
+members, output before a later member arrives, byte-at-a-time delivery, items
+split across members, members larger than the internal buffers, and footer
+checksum validation.

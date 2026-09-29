@@ -14,6 +14,41 @@ HOST = "127.0.0.1"
 PORT = 8080
 STREAM_IDENTIFIER = b"\xff\x06\x00\x00sNaPpY"
 CRC32C_POLYNOMIAL = 0x82F63B78
+LONG_GZIP_ITEM = b"long-member-" + (b"x" * (256 * 1024))
+
+
+class OutputCollector:
+    def __init__(self, stream):
+        self.stream = stream
+        self.chunks = []
+        self.condition = threading.Condition()
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+
+    def _read(self):
+        while True:
+            chunk = self.stream.read1(8192)
+            if not chunk:
+                break
+            with self.condition:
+                self.chunks.append(chunk)
+                self.condition.notify_all()
+
+    def wait_for(self, expected, timeout=2):
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while expected not in b"".join(self.chunks):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.condition.wait(remaining)
+            return True
+
+    def finish(self):
+        self.thread.join(timeout=5)
+        if self.thread.is_alive():
+            raise RuntimeError("stdout collector did not stop")
+        return b"".join(self.chunks)
 
 
 def crc32c(data):
@@ -83,11 +118,28 @@ def send(payload):
         connection.shutdown(socket.SHUT_WR)
 
 
-def send_fragmented(payload, fragment_size=1):
+def send_fragmented(payload, fragment_size=1, pause=0):
     with socket.create_connection((HOST, PORT), timeout=3) as connection:
         for offset in range(0, len(payload), fragment_size):
             connection.sendall(payload[offset : offset + fragment_size])
+            if pause:
+                time.sleep(pause)
         connection.shutdown(socket.SHUT_WR)
+
+
+def send_with_pauses(parts, pause=0.1):
+    with socket.create_connection((HOST, PORT), timeout=3) as connection:
+        for index, part in enumerate(parts):
+            connection.sendall(part)
+            if index + 1 != len(parts):
+                time.sleep(pause)
+        connection.shutdown(socket.SHUT_WR)
+
+
+def corrupt_gzip_checksum(payload):
+    corrupted = bytearray(payload)
+    corrupted[-8] ^= 0xFF
+    return bytes(corrupted)
 
 
 def wait_until_listening(process, probe):
@@ -123,6 +175,7 @@ def main():
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    output = OutputCollector(process.stdout)
 
     try:
         if compression == "gzip":
@@ -134,7 +187,7 @@ def main():
         wait_until_listening(process, probe)
 
         if compression == "gzip":
-            run_gzip_tests()
+            run_gzip_tests(output)
         elif compression == "snappy":
             run_snappy_tests()
         else:
@@ -146,15 +199,54 @@ def main():
         time.sleep(1)
     finally:
         process.terminate()
-        stdout, stderr = process.communicate(timeout=5)
+        process.wait(timeout=5)
+        stdout = output.finish()
+        stderr = process.stderr.read()
 
     check_results(compression, stdout, stderr)
 
 
-def run_gzip_tests():
+def run_gzip_tests(output):
     first_payload = b"one;;embedded\nnewline;crlf\r\ninside;last"
     send_fragmented(gzip.compress(first_payload))
-    send(gzip.compress(b"joined item;"))
+
+    # A complete member must be processed while the connection is still open;
+    # neither a following member nor socket EOF may be needed to flush it.
+    first_member_item = b"available-before-second-member\n"
+    with socket.create_connection((HOST, PORT), timeout=3) as connection:
+        connection.sendall(gzip.compress(first_member_item[:-1] + b";"))
+        if not output.wait_for(first_member_item):
+            raise AssertionError(
+                "completed gzip member was not emitted before later input"
+            )
+        connection.sendall(gzip.compress(b"second-member;"))
+        connection.shutdown(socket.SHUT_WR)
+
+    # Exercise a member split across many reads, including pauses long enough
+    # for the server to observe temporary input starvation as distinct from EOF.
+    send_fragmented(gzip.compress(b"bytewise-delivery;"), pause=0.002)
+
+    # Concatenated members are one decompressed stream, whether they arrive in
+    # one write or with an arbitrary pause while the connection remains open.
+    send(gzip.compress(b"joined ") + gzip.compress(b"item;"))
+    send_with_pauses(
+        [gzip.compress(b"delayed-one;"), gzip.compress(b"delayed-two;")]
+    )
+    send_with_pauses(
+        [gzip.compress(b"split-across-"), gzip.compress(b"members;")]
+    )
+
+    # Empty and repeated members must neither end nor reset the application
+    # item stream.
+    send(
+        gzip.compress(b"")
+        + gzip.compress(b"three-a;")
+        + gzip.compress(b"three-b;")
+        + gzip.compress(b"three-c;")
+    )
+
+    # The decompressed body is far larger than both socket and Boost buffers.
+    send(gzip.compress(LONG_GZIP_ITEM + b";"))
 
     concurrent_payloads = [
         b"client-a-1;client-a-2;",
@@ -171,6 +263,12 @@ def run_gzip_tests():
 
     send(b"not a gzip stream")
     send(gzip.compress(b"truncated")[:-4])
+    send(corrupt_gzip_checksum(gzip.compress(b"bad-checksum")))
+    send(
+        gzip.compress(b"before-later-corruption;")
+        + corrupt_gzip_checksum(gzip.compress(b"corrupt-later"))
+    )
+    send(gzip.compress(b"before-malformed-member;") + b"not another member")
     send(gzip.compress(b"after-error;"))
 
 
@@ -253,7 +351,24 @@ def check_results(compression, stdout, stderr):
         b"client-b-2\n",
         b"after-error\n",
     ]
-    if compression == "snappy":
+    if compression == "gzip":
+        expected.extend(
+            [
+                b"available-before-second-member\n",
+                b"second-member\n",
+                b"bytewise-delivery\n",
+                b"delayed-one\n",
+                b"delayed-two\n",
+                b"split-across-members\n",
+                b"three-a\n",
+                b"three-b\n",
+                b"three-c\n",
+                LONG_GZIP_ITEM + b"\n",
+                b"before-later-corruption\n",
+                b"before-malformed-member\n",
+            ]
+        )
+    elif compression == "snappy":
         expected.append(b"before-corruption\n")
 
     if collections.Counter(actual) != collections.Counter(expected):
@@ -272,6 +387,13 @@ def check_results(compression, stdout, stderr):
         [b"client-a-1\n", b"client-a-2\n"],
         [b"client-b-1\n", b"client-b-2\n"],
     ]
+    if compression == "gzip":
+        ordered_groups.extend(
+            [
+                [b"delayed-one\n", b"delayed-two\n"],
+                [b"three-a\n", b"three-b\n", b"three-c\n"],
+            ]
+        )
     for group in ordered_groups:
         positions = [actual.index(line) for line in group]
         if positions != sorted(positions):
@@ -282,7 +404,7 @@ def check_results(compression, stdout, stderr):
             f"invalid {compression} stream".encode() in line.lower()
             for line in stderr.splitlines()
         )
-        minimum_reports = 4 if compression == "snappy" else 2
+        minimum_reports = 4 if compression == "snappy" else 5
         if invalid_reports < minimum_reports:
             raise AssertionError(f"invalid streams were not reported: {stderr!r}")
 

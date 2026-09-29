@@ -5,6 +5,7 @@ project(stream_gzip VERSION 1.0.0 LANGUAGES CXX)
 find_package(Boost CONFIG REQUIRED COMPONENTS asio iostreams)
 find_package(Snappy CONFIG REQUIRED)
 find_package(Crc32c CONFIG REQUIRED)
+find_package(ZLIB REQUIRED)
 
 add_executable(stream_gzip
     src/main.cpp
@@ -16,6 +17,7 @@ target_link_libraries(stream_gzip PRIVATE
     Boost::iostreams
     Snappy::snappy
     Crc32c::crc32c
+    ZLIB::ZLIB
 )
 
 if(WIN32)

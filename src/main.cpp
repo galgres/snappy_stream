@@ -1,9 +1,9 @@
 #include <boost/asio.hpp>
 #include <boost/iostreams/categories.hpp>
-#include <boost/iostreams/filter/gzip.hpp>
 #include <boost/iostreams/operations.hpp>
 #include <crc32c/crc32c.h>
 #include <snappy.h>
+#include <zlib.h>
 
 #include <algorithm>
 #include <array>
@@ -11,6 +11,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -82,9 +83,6 @@ public:
     using char_type = char;
     using category = boost::iostreams::source_tag;
 
-    explicit chunk_source(bool hold_back_lookahead)
-        : hold_back_lookahead_(hold_back_lookahead) {}
-
     void set_chunk(const char* data, std::size_t size) {
         if (offset_ != 0) {
             data_.erase(data_.begin(), data_.begin() + offset_);
@@ -102,13 +100,7 @@ public:
             return 0;
         }
 
-        std::size_t available = data_.size() - offset_;
-        // gzip_decompressor peeks one byte beyond its footer to detect a
-        // concatenated member. Keep a byte pending until more input or EOF so
-        // that a socket-read boundary cannot be mistaken for that lookahead.
-        if (hold_back_lookahead_ && !finished_ && available != 0) {
-            --available;
-        }
+        const std::size_t available = data_.size() - offset_;
         if (available == 0) {
             return finished_ ? -1 : 0;
         }
@@ -125,12 +117,137 @@ private:
     std::vector<char> data_;
     std::size_t offset_ = 0;
     bool finished_ = false;
-    bool hold_back_lookahead_;
 };
 
 class snappy_stream_error : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
+};
+
+class gzip_stream_error : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+class gzip_decompressor {
+public:
+    gzip_decompressor() {
+        const int result = inflateInit2(&stream_, MAX_WBITS + 16);
+        if (result != Z_OK) {
+            throw std::runtime_error(
+                "could not initialize zlib gzip decompressor (error " +
+                std::to_string(result) + ')');
+        }
+        initialized_ = true;
+    }
+
+    ~gzip_decompressor() {
+        if (initialized_) {
+            inflateEnd(&stream_);
+        }
+    }
+
+    gzip_decompressor(const gzip_decompressor&) = delete;
+    gzip_decompressor& operator=(const gzip_decompressor&) = delete;
+
+    template <typename Consumer>
+    void write(const char* data, std::size_t size, Consumer&& consume) {
+        while (size != 0) {
+            const std::size_t input_size = (std::min)(
+                size,
+                static_cast<std::size_t>((std::numeric_limits<uInt>::max)()));
+            stream_.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data));
+            stream_.avail_in = static_cast<uInt>(input_size);
+            at_member_boundary_ = false;
+
+            for (;;) {
+                stream_.next_out = output_.data();
+                stream_.avail_out = static_cast<uInt>(output_.size());
+
+                const uInt input_before = stream_.avail_in;
+                const int result = inflate(&stream_, Z_NO_FLUSH);
+                const std::size_t produced = output_.size() - stream_.avail_out;
+                if (produced != 0) {
+                    consume(
+                        reinterpret_cast<const char*>(output_.data()),
+                        produced);
+                }
+
+                if (result == Z_STREAM_END) {
+                    saw_complete_member_ = true;
+                    at_member_boundary_ = true;
+
+                    Bytef* const remaining_input = stream_.next_in;
+                    const uInt remaining_size = stream_.avail_in;
+                    const int reset_result = inflateReset(&stream_);
+                    if (reset_result != Z_OK) {
+                        throw_zlib_error("could not reset gzip decompressor", reset_result);
+                    }
+                    stream_.next_in = remaining_input;
+                    stream_.avail_in = remaining_size;
+
+                    if (remaining_size == 0) {
+                        break;
+                    }
+                    at_member_boundary_ = false;
+                    continue;
+                }
+
+                if (result == Z_OK) {
+                    if (stream_.avail_in == 0 && stream_.avail_out != 0) {
+                        break;
+                    }
+                    if (stream_.avail_in == input_before && produced == 0) {
+                        throw std::runtime_error(
+                            "zlib gzip decompressor made no progress");
+                    }
+                    continue;
+                }
+
+                if (result == Z_BUF_ERROR && stream_.avail_in == 0) {
+                    break;
+                }
+                throw_zlib_error("invalid gzip data", result);
+            }
+
+            data += input_size;
+            size -= input_size;
+        }
+    }
+
+    void finish() const {
+        if (!saw_complete_member_) {
+            throw gzip_stream_error("missing or incomplete gzip member");
+        }
+        if (!at_member_boundary_) {
+            throw gzip_stream_error("truncated gzip member");
+        }
+    }
+
+private:
+    [[noreturn]] void throw_zlib_error(const char* context, int result) const {
+        std::string message(context);
+        if (stream_.msg != nullptr) {
+            message += ": ";
+            message += stream_.msg;
+        } else {
+            message += " (zlib error ";
+            message += std::to_string(result);
+            message += ')';
+        }
+
+        if (result == Z_DATA_ERROR || result == Z_NEED_DICT ||
+            result == Z_BUF_ERROR) {
+            throw gzip_stream_error(message);
+        }
+        throw std::runtime_error(message);
+    }
+
+    z_stream stream_{};
+    std::array<Bytef, 8192> output_{};
+    bool initialized_ = false;
+    bool saw_complete_member_ = false;
+    bool at_member_boundary_ = true;
 };
 
 class passthrough_filter {
@@ -355,10 +472,7 @@ class client_session
 public:
     explicit client_session(tcp::socket socket)
         : socket_(std::move(socket)),
-          peer_(peer_name(socket_)),
-          compressed_(std::is_same<
-                      Decompressor,
-                      boost::iostreams::gzip_decompressor>::value) {}
+          peer_(peer_name(socket_)) {}
 
     void start() {
         read_next_chunk();
@@ -377,8 +491,7 @@ private:
     void handle_read(const boost::system::error_code& error, std::size_t count) {
         try {
             if (count != 0) {
-                compressed_.set_chunk(input_buffer_.data(), count);
-                drain_decompressor();
+                process_input(input_buffer_.data(), count);
             }
 
             if (!error) {
@@ -387,14 +500,13 @@ private:
             }
 
             if (error == boost::asio::error::eof) {
-                compressed_.finish();
-                drain_decompressor();
+                finish_decompressor();
                 finish_current_item();
                 return;
             }
 
             report_error(peer_, std::string("socket error: ") + error.message());
-        } catch (const boost::iostreams::gzip_error& exception) {
+        } catch (const gzip_stream_error& exception) {
             report_error(peer_, std::string("invalid gzip stream: ") + exception.what());
         } catch (const snappy_stream_error& exception) {
             report_error(peer_, std::string("invalid snappy stream: ") + exception.what());
@@ -402,6 +514,33 @@ private:
             report_error(peer_, std::string("socket error: ") + exception.what());
         } catch (const std::exception& exception) {
             report_error(peer_, std::string("unexpected error: ") + exception.what());
+        }
+    }
+
+    void process_input(const char* data, std::size_t size) {
+        if constexpr (std::is_same_v<
+                          Decompressor,
+                          gzip_decompressor>) {
+            decompressor_.write(
+                data,
+                size,
+                [this](const char* output, std::size_t output_size) {
+                    consume_decompressed(output, output_size);
+                });
+        } else {
+            compressed_.set_chunk(data, size);
+            drain_decompressor();
+        }
+    }
+
+    void finish_decompressor() {
+        if constexpr (std::is_same_v<
+                          Decompressor,
+                          gzip_decompressor>) {
+            decompressor_.finish();
+        } else {
+            compressed_.finish();
+            drain_decompressor();
         }
     }
 
@@ -572,7 +711,7 @@ int main(int argc, char* argv[]) {
     try {
         switch (parse_arguments(argc, argv)) {
         case compression::gzip:
-            run_server<boost::iostreams::gzip_decompressor>();
+            run_server<gzip_decompressor>();
             break;
         case compression::snappy:
             run_server<snappy_framed_decompressor>();
